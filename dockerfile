@@ -1,17 +1,17 @@
-# Используем официальный Python
+# Use official Python 3.11 image
 FROM python:3.11-slim
 
-# Устанавливаем ffmpeg
-RUN apt-get update && apt-get install -y ffmpeg git curl && rm -rf /var/lib/apt/lists/*
-
-# Рабочая директория
+# Set working directory
 WORKDIR /app
 
-# Копируем все файлы проекта
-COPY . .
+# Copy files
+COPY . /app
 
-# Устанавливаем зависимости
-RUN pip install --no-cache-dir -r requirements.txt
+# Install system dependencies for aiohttp (Linux)
+RUN apt-get update && \
+    apt-get install -y build-essential libssl-dev && \
+    pip install --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
 
-# Запуск бота
+# Run the bot
 CMD ["python", "main.py"]
