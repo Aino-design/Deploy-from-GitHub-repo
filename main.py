@@ -1,4 +1,7 @@
-# main.py — переписанная стабильная версия
+# main.py — переписанная версия
+# Изменения: бот больше не скачивает YouTube (при попытке — отвечает, что не поддерживает).
+# Добавлена поддержка скачивания Instagram видео (best-effort через yt-dlp).
+
 import os
 import asyncio
 import tempfile
@@ -24,7 +27,7 @@ from aiogram.types import (
 )
 
 # ----------------- Настройки -----------------
-API_TOKEN = os.getenv("TOKEN")  # <- вставь токен  # или вставь строкой: "123:ABC..."
+API_TOKEN = os.getenv("TOKEN")  # <- вставь токен
 if not API_TOKEN:
     raise SystemExit("ERROR: Установи переменную окружения TOKEN или вставь токен в код.")
 
@@ -45,8 +48,7 @@ YDL_FORMATS = {
 }
 
 # Optional: указать папку где установлен ffmpeg (если хочешь использовать)
-# Пример для Windows: r"C:\ffmpeg\bin"
-FFMPEG_FOLDER = None  # или r"C:\Users\user\Desktop\ffmpeg\bin"
+FFMPEG_FOLDER = None
 
 # Common opts base (cookiefile and ffmpeg_location добавятся динамически)
 YDL_COMMON_OPTS_BASE = {
@@ -171,7 +173,7 @@ async def register_commands():
 async def start_handler(msg: Message):
     await ensure_user(msg.from_user.id, msg.from_user.username)
     await msg.answer(
-        "Привет! 👋\nЭтот бот скачивает TikTok.\nОтправь ссылку на видео или нажми «Скачать видео».",
+        "Привет! 👋\nЭтот бот скачивает TikTok и Instagram.\nЕсли пришлёшь ссылку с YouTube — бот ответит, что это не поддерживается.",
         reply_markup=main_buttons()
     )
 
@@ -187,7 +189,7 @@ async def cmd_profile(msg: Message):
 
 @dp.message(Command("about"))
 async def cmd_about(msg: Message):
-    await msg.answer("Этот бот скачивает TikTok (через yt-dlp). Файлы удаляются после отправки.")
+    await msg.answer("Этот бот скачивает TikTok и Instagram (через yt-dlp/backup). YouTube не поддерживается.")
 
 @dp.message(Command("premium"))
 async def cmd_premium(msg: Message):
@@ -246,7 +248,7 @@ async def cb_download(cq: CallbackQuery):
         await process_incoming_link(user_id, cq.message.chat.id, last, cq.message)
     else:
         awaiting_link[user_id] = True
-        await cq.message.answer("📩 Отправь ссылку на TikTok")
+        await cq.message.answer("📩 Отправь ссылку на TikTok или Instagram")
     await cq.answer()
 
 # ----------------- Queue -----------------
@@ -258,7 +260,46 @@ async def enqueue_download(job: DownloadJob):
             download_queue.append(job)
     logger.info("Job queued: %s", job)
 
-# blocking yt-dlp call (runs in executor)
+
+# helper: blocking generic yt-dlp call (used for Instagram and fallback)
+class YouTubeNotSupported(Exception):
+    """Raised when a YouTube URL is encountered and downloads are intentionally blocked."""
+    pass
+
+
+def run_yt_dlp_blocking(url: str, outdir: str, ydl_format: Optional[str] = None):
+    # explicit protection: do not allow YouTube downloads
+    if "youtube.com" in url or "youtu.be" in url:
+        raise YouTubeNotSupported()
+
+    ydl_opts = {
+        "format": ydl_format or YDL_FORMATS["normal"],
+        "outtmpl": os.path.join(outdir, "%(id)s.%(ext)s"),
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "http_headers": {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+    }
+    if COOKIES_FILE:
+        ydl_opts["cookiefile"] = COOKIES_FILE
+
+    with YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        filename = ydl.prepare_filename(info)
+        return filename, info
+
+
+async def send_user_error(chat_id: int, e: Exception, prefix: Optional[str] = None):
+    try:
+        if isinstance(e, YouTubeNotSupported):
+            await bot.send_message(chat_id, "❌ Этот бот не может загружать YouTube видео.")
+        else:
+            if prefix:
+                await bot.send_message(chat_id, f"❌ {prefix}{e}")
+            else:
+                await bot.send_message(chat_id, f"❌ Ошибка: {e}")
+    except Exception:
+        logger.exception("Failed to notify user about error")
 
 
 async def download_worker():
@@ -290,6 +331,14 @@ async def download_worker():
                 filename = None
                 info = {}
 
+                # Explicit YouTube block: respond and skip
+                if "youtube.com" in job.url or "youtu.be" in job.url:
+                    try:
+                        await bot.send_message(job.chat_id, "❌ Этот бот не может загружать YouTube видео.")
+                    except Exception:
+                        pass
+                    continue
+
                 # TikTok handling
                 if "tiktok" in job.url or "vm.tiktok" in job.url:
                     try:
@@ -306,18 +355,27 @@ async def download_worker():
                         except Exception:
                             pass
                         continue
-                else:
-                    # YouTube / other sites via yt-dlp
-                    def blocking():
-                        return run_yt_dlp_blocking(job.url, tmpdir, None)
+
+                # Instagram handling
+                elif "instagram.com" in job.url or "instagr.am" in job.url:
                     try:
-                        filename, info = await loop.run_in_executor(None, blocking)
+                        filename, info = await loop.run_in_executor(None, run_yt_dlp_blocking, job.url, tmpdir, YDL_FORMATS["normal"])  # blocking
                     except Exception as e:
-                        logger.exception("Download error for %s", job.url)
+                        logger.exception("Instagram download error for %s", job.url)
+                        await send_user_error(job.chat_id, e, prefix="Ошибка при скачивании Instagram: ")
                         try:
-                            await bot.send_message(job.chat_id, f"❌ Ошибка при скачивании: {e}")
+                            shutil.rmtree(tmpdir)
                         except Exception:
                             pass
+                        continue
+
+                else:
+                    # For other sites (non-YouTube), try generic yt-dlp
+                    try:
+                        filename, info = await loop.run_in_executor(None, run_yt_dlp_blocking, job.url, tmpdir, None)
+                    except Exception as e:
+                        logger.exception("Download error for %s", job.url)
+                        await send_user_error(job.chat_id, e)
                         continue
 
                 # thumbnail
@@ -388,6 +446,14 @@ async def process_incoming_link(user_id: int, chat_id: int, link: str, msg_obj: 
     row = await get_user_row(user_id)
     premium_level = row[2] if row else "обычный"
 
+    # If link is YouTube -> immediately inform user
+    if "youtube.com" in link or "youtu.be" in link:
+        if msg_obj:
+            await msg_obj.answer("❌ Этот бот не может загружать YouTube видео.")
+        else:
+            await bot.send_message(chat_id, "❌ Этот бот не может загружать YouTube видео.")
+        return
+
     if not await can_user_download(user_id):
         if msg_obj:
             await msg_obj.answer("❌ Лимит скачиваний на сегодня исчерпан.")
@@ -399,26 +465,35 @@ async def process_incoming_link(user_id: int, chat_id: int, link: str, msg_obj: 
     await enqueue_download(job)
 
     if msg_obj:
-        await msg_obj.answer("⏳ Загрузка началась, подождите...")
+        await msg_obj.answer("⏳ Загрузка началась, пожалуйста подожди...")
     else:
-        await bot.send_message(chat_id, "⏳ Загрузка началась, подождите...")
+        await bot.send_message(chat_id, "⏳ Загрузка началась, пожалуйста подожди...")
 
 @dp.message()
 async def handle_message(msg: Message):
     user_id = msg.from_user.id
     text = (msg.text or "").strip()
 
-    is_link = any(x in text for x in ("youtube.com", "youtu.be", "tiktok.com", "vm.tiktok"))
-    if is_link:
+    # detect link types
+    is_youtube = any(x in text for x in ("youtube.com", "youtu.be"))
+    is_tiktok = any(x in text for x in ("tiktok.com", "vm.tiktok"))
+    is_instagram = any(x in text for x in ("instagram.com", "instagr.am"))
+
+    if is_youtube:
+        await msg.answer("❌ Этот бот не может загружать YouTube видео.")
+        return
+
+    is_link = is_tiktok or is_instagram or is_youtube or text.startswith("http")
+    if is_link and (is_tiktok or is_instagram):
         await process_incoming_link(user_id, msg.chat.id, text, msg)
         return
 
     if awaiting_link.get(user_id):
         awaiting_link[user_id] = False
-        if is_link:
+        if is_link and (is_tiktok or is_instagram):
             await process_incoming_link(user_id, msg.chat.id, text, msg)
         else:
-            await msg.answer("❌ Пожалуйста, отправь ссылку TikTok.")
+            await msg.answer("❌ Пожалуйста, отправь ссылку на TikTok или Instagram.")
         return
 
     await msg.answer("Нажми «Скачать видео» или используй /download. Для справки /about", reply_markup=main_buttons())
@@ -505,7 +580,10 @@ async def main():
     finally:
         for w in workers:
             w.cancel()
-        await bot.session.close()
+        try:
+            await bot.session.close()
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     asyncio.run(main())
