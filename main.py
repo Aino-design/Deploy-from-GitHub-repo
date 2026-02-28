@@ -187,7 +187,7 @@ async def cmd_profile(msg: Message):
 
 @dp.message(Command("about"))
 async def cmd_about(msg: Message):
-    await msg.answer("Этот бот скачивает и TikTok (через yt-dlp). Файлы удаляются после отправки.")
+    await msg.answer("Этот бот скачивает TikTok (через yt-dlp). Файлы удаляются после отправки.")
 
 @dp.message(Command("premium"))
 async def cmd_premium(msg: Message):
@@ -246,7 +246,7 @@ async def cb_download(cq: CallbackQuery):
         await process_incoming_link(user_id, cq.message.chat.id, last, cq.message)
     else:
         awaiting_link[user_id] = True
-        await cq.message.answer("📩 Отправь ссылку на YouTube Shorts или TikTok")
+        await cq.message.answer("📩 Отправь ссылку на TikTok")
     await cq.answer()
 
 # ----------------- Queue -----------------
