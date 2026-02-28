@@ -30,7 +30,7 @@ from aiogram.types import (
 )
 
 # ---------------- Config ----------------
-API_TOKEN = os.getenv("8736949755:AAG8So7fVUlyNpJxmGQptWQNk5bx7kjPoLs")  # <- вставь токен
+TOKEN = os.getenv("TOKEN")  # <- вставь токен
 DB_PATH = "bot_users.db"  # (оставлено как есть, не используем БД в минимальной версии)
 DOWNLOAD_WORKERS = 1
 LOG_LEVEL = logging.INFO
