@@ -1,4 +1,4 @@
-# main.py — обновлённая версия (сохранённая логика + исправления)
+# main.py — переписанная стабильная версия
 import os
 import asyncio
 import tempfile
@@ -24,39 +24,45 @@ from aiogram.types import (
 )
 
 # ----------------- Настройки -----------------
-API_TOKEN = "8736949755:AAG8So7fVUlyNpJxmGQptWQNk5bx7kjPoLs"
+API_TOKEN = os.getenv("TOKEN")  # <- вставь токен  # или вставь строкой: "123:ABC..."
 if not API_TOKEN:
-    raise SystemExit("ERROR: TOKEN не найден. Установи переменную окружения TOKEN или вставь токен в код.")
+    raise SystemExit("ERROR: Установи переменную окружения TOKEN или вставь токен в код.")
 
 DB_PATH = "bot_users.db"
 DOWNLOAD_WORKERS = 1
 LOG_LEVEL = logging.INFO
 
-# Админы
-ADMIN_IDS = [6705555401]  # твой числовой ID
-ADMIN_USERNAME = "KRONIK568"  # пользователь, которому разрешено self-admin
+# admin ids
+ADMIN_IDS = [6705555401]  # <- поставь сюда свой числовой ID
 
-# Лимиты
-LIMITS = {"обычный": 4, "золотой": 10, "алмазный": None}  # None = неограниченно
+# limits by premium level
+LIMITS = {"обычный": 4, "золотой": 10, "алмазный": None}  # None = unlimited
 
-# Форматы yt-dlp — NORMAL изменён, чтобы не требовать ffmpeg
+# ideal yt-dlp formats (always mp4 if possible, fallback to best)
 YDL_FORMATS = {
-    "diamond": "bestvideo+bestaudio/best",
-    "normal": "best[height<=720]/best",  # не требует слияния форматов
+    "diamond": "best[ext=mp4]/best",
+    "normal": "best[ext=mp4]/best",
 }
 
-# Общие опции yt-dlp
-YDL_COMMON_OPTS = {
+# Optional: указать папку где установлен ffmpeg (если хочешь использовать)
+# Пример для Windows: r"C:\ffmpeg\bin"
+FFMPEG_FOLDER = None  # или r"C:\Users\user\Desktop\ffmpeg\bin"
+
+# Common opts base (cookiefile and ffmpeg_location добавятся динамически)
+YDL_COMMON_OPTS_BASE = {
     "noplaylist": True,
     "no_warnings": True,
     "quiet": True,
 }
 
-# Логи
+# automatic cookiefile if exists
+COOKIES_FILE = "cookies.txt" if os.path.exists("cookies.txt") else None
+
+# Logging
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
-# ----------------- Бот / очередь -----------------
+# ----------------- Bot / queue -----------------
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher()
 
@@ -72,9 +78,9 @@ class DownloadJob:
 download_queue: deque[DownloadJob] = deque()
 queue_lock = asyncio.Lock()
 awaiting_link: Dict[int, bool] = {}  # user_id -> waiting for link
-last_links: Dict[int, str] = {}  # user_id -> last sent link (allows "send link first, then press button")
+last_links: Dict[int, str] = {}  # last sent link from user
 
-# ----------------- БД -----------------
+# ----------------- Database -----------------
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
@@ -140,14 +146,13 @@ async def can_user_download(user_id: int) -> bool:
         return True
     return downloads_today < limit
 
-# ----------------- UI / команды -----------------
+# ----------------- UI / commands -----------------
 def main_buttons() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="👤 Профиль", callback_data="profile")],
         [InlineKeyboardButton(text="🎬 Скачать видео", callback_data="download")],
         [InlineKeyboardButton(text="ℹ️ О боте", callback_data="about")],
         [InlineKeyboardButton(text="💎 Премиум подписка", callback_data="premium")],
-        [InlineKeyboardButton(text="🔑 Выдать себе админку", callback_data="make_admin")],
     ])
 
 async def register_commands():
@@ -161,12 +166,12 @@ async def register_commands():
     ]
     await bot.set_my_commands(commands)
 
-# ----------------- Обработчики -----------------
+# ----------------- Handlers -----------------
 @dp.message(CommandStart())
 async def start_handler(msg: Message):
     await ensure_user(msg.from_user.id, msg.from_user.username)
     await msg.answer(
-        "Привет! 👋\nЭтот бот скачивает YouTube Shorts и TikTok.\nОтправь ссылку или нажми «Скачать видео».",
+        "Привет! 👋\nЭтот бот скачивает YouTube Shorts и TikTok.\nОтправь ссылку на видео или нажми «Скачать видео».",
         reply_markup=main_buttons()
     )
 
@@ -182,28 +187,7 @@ async def cmd_profile(msg: Message):
 
 @dp.message(Command("about"))
 async def cmd_about(msg: Message):
-    await msg.answer("Бот скачивает YouTube Shorts и TikTok (через yt-dlp). Файлы удаляются после отправки.")
-
-@dp.message(Command("download"))
-async def cmd_download(msg: Message):
-    # Если команда использована с аргументом — /download <url>
-    text = (msg.text or "").strip()
-    parts = text.split(maxsplit=1)
-    if len(parts) == 2 and parts[1]:
-        link = parts[1].strip()
-        # обработаем как ссылка
-        await process_incoming_link(msg.from_user.id, msg.chat.id, link, msg)
-        return
-
-    # если у нас есть последняя ссылка от этого пользователя — используем её
-    last = last_links.get(msg.from_user.id)
-    if last:
-        await process_incoming_link(msg.from_user.id, msg.chat.id, last, msg)
-        return
-
-    # иначе — просим ссылку (кнопка всё ещё полезна)
-    awaiting_link[msg.from_user.id] = True
-    await msg.answer("📩 Отправь ссылку на YouTube Shorts или TikTok")
+    await msg.answer("Этот бот скачивает YouTube Shorts и TikTok (через yt-dlp). Файлы удаляются после отправки.")
 
 @dp.message(Command("premium"))
 async def cmd_premium(msg: Message):
@@ -241,7 +225,7 @@ async def cmd_grant_premium(msg: Message):
     except Exception:
         pass
 
-# колбэки
+# callbacks
 @dp.callback_query(lambda c: c.data == "profile")
 async def cb_profile(cq: CallbackQuery):
     await cmd_profile(cq.message)
@@ -265,16 +249,7 @@ async def cb_download(cq: CallbackQuery):
         await cq.message.answer("📩 Отправь ссылку на YouTube Shorts или TikTok")
     await cq.answer()
 
-@dp.callback_query(lambda c: c.data == "make_admin")
-async def cb_make_admin(cq: CallbackQuery):
-    if cq.from_user.username == ADMIN_USERNAME or cq.from_user.id in ADMIN_IDS:
-        # добавим в локальный набор премиум (опционально)
-        await cq.message.answer("✅ Ты теперь админ и премиум!")
-    else:
-        await cq.message.answer("❌ Только владелец бота может это сделать.")
-    await cq.answer()
-
-# ----------------- Очередь загрузок -----------------
+# ----------------- Queue -----------------
 async def enqueue_download(job: DownloadJob):
     async with queue_lock:
         if job.premium_level == "алмазный":
@@ -283,23 +258,14 @@ async def enqueue_download(job: DownloadJob):
             download_queue.append(job)
     logger.info("Job queued: %s", job)
 
-def run_yt_dlp_blocking(url: str, outdir: str, fmt: str):
-    opts = YDL_COMMON_OPTS.copy()
-    opts.update({
-        "format": fmt,
-        "outtmpl": os.path.join(outdir, "%(id)s.%(ext)s"),
-        # не добавляем merge_output_format, чтобы избежать требований ffmpeg
-    })
-    with YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        filename = ydl.prepare_filename(info)
-    return filename, info
+# blocking yt-dlp call (runs in executor)
+
 
 async def download_worker():
     logger.info("Download worker started")
     loop = asyncio.get_event_loop()
 
-    # общая сессия для загрузки миниатюр / API
+    # reuse aiohttp session for thumbnails and API
     async with aiohttp.ClientSession() as session:
         while True:
             job = None
@@ -321,12 +287,10 @@ async def download_worker():
 
             tmpdir = tempfile.mkdtemp(prefix="bot_dl_")
             try:
-                fmt = YDL_FORMATS["diamond"] if job.premium_level == "алмазный" else YDL_FORMATS["normal"]
-
                 filename = None
                 info = {}
 
-                # TikTok
+                # TikTok handling
                 if "tiktok" in job.url or "vm.tiktok" in job.url:
                     try:
                         filename = await download_tiktok(job.url, session=session)
@@ -343,9 +307,9 @@ async def download_worker():
                             pass
                         continue
                 else:
-                    # YouTube path
+                    # YouTube / other sites via yt-dlp
                     def blocking():
-                        return run_yt_dlp_blocking(job.url, tmpdir, fmt)
+                        return run_yt_dlp_blocking(job.url, tmpdir, None)
                     try:
                         filename, info = await loop.run_in_executor(None, blocking)
                     except Exception as e:
@@ -389,6 +353,7 @@ async def download_worker():
                         except Exception:
                             pass
                     finally:
+                        # safe cleanup
                         try:
                             os.remove(filename)
                         except Exception:
@@ -416,9 +381,8 @@ async def download_worker():
                     pass
             await asyncio.sleep(0.2)
 
-# ----------------- Обработка входящих сообщений -----------------
+# ----------------- Incoming messages -----------------
 async def process_incoming_link(user_id: int, chat_id: int, link: str, msg_obj: Optional[Message] = None):
-    # Сохраняем последнюю ссылку
     last_links[user_id] = link
     await ensure_user(user_id, None)
     row = await get_user_row(user_id)
@@ -449,7 +413,6 @@ async def handle_message(msg: Message):
         await process_incoming_link(user_id, msg.chat.id, text, msg)
         return
 
-    # если пользователь ранее нажал /download и теперь отправляет ссылку — обработаем
     if awaiting_link.get(user_id):
         awaiting_link[user_id] = False
         if is_link:
@@ -458,7 +421,6 @@ async def handle_message(msg: Message):
             await msg.answer("❌ Пожалуйста, отправь ссылку на YouTube Shorts или TikTok.")
         return
 
-    # иначе — подсказка
     await msg.answer("Нажми «Скачать видео» или используй /download. Для справки /about", reply_markup=main_buttons())
 
 # ----------------- TikTok downloader -----------------
@@ -474,12 +436,11 @@ async def download_tiktok(url: str, session: Optional[aiohttp.ClientSession] = N
             "quiet": True,
             "no_warnings": True,
             "noplaylist": True,
-            "http_headers": {"User-Agent": "Mozilla/5.0"},
+            "http_headers": {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
         }
         with YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
-            filename = ydl.prepare_filename(info)
-            return filename
+            return ydl.prepare_filename(info)
 
     try:
         filename = await loop.run_in_executor(None, run_ydl)
@@ -488,6 +449,7 @@ async def download_tiktok(url: str, session: Optional[aiohttp.ClientSession] = N
     except Exception as e:
         logger.debug("yt-dlp failed for TikTok: %s", e)
 
+    # backup via public API (best-effort)
     api = f"https://api.tikwm.com/?url={url}"
     own_session = False
     if session is None:
@@ -532,11 +494,10 @@ async def download_tiktok(url: str, session: Optional[aiohttp.ClientSession] = N
         if own_session:
             await session.close()
 
-# ----------------- Запуск -----------------
+# ----------------- Run -----------------
 async def main():
     await init_db()
     await register_commands()
-    # старт workers
     workers = [asyncio.create_task(download_worker()) for _ in range(DOWNLOAD_WORKERS)]
     try:
         logger.info("Bot starting polling")
