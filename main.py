@@ -1,12 +1,4 @@
-# main.py
-"""
-Telegram bot:
-- скачивает TikTok (включая фото-посты: скачивает все картинки + отдельно музыку, если есть)
-- скачивает Instagram (через yt-dlp)
-- YouTube жестко заблокирован (бот отправляет понятный ответ)
-- UI: Профиль, Скачать видео, О боте, Премиум
-- Админ: /grant_premium <user_id> <обычный|золотой|алмазный>
-"""
+# main.py — исправленная версия (без упоминаний YouTube в стартовых текстах)
 import os
 import re
 import json
@@ -34,32 +26,28 @@ from aiogram.types import (
 )
 
 # ---------------- CONFIG ----------------
-TOKEN = os.getenv("TOKEN")  # <- вставь токен
+TOKEN = os.getenv("TOKEN")   # <- вставь токен
 if not TOKEN or TOKEN.startswith("PASTE_"):
     raise SystemExit("ERROR: Вставь токен в переменную TOKEN в main.py")
 
 DB_PATH = "bot_users.db"
 DOWNLOAD_WORKERS = 1
 LOG_LEVEL = logging.INFO
-ADMIN_IDS = [6705555401]  # <- сюда свой id если нужно
+ADMIN_IDS = [6705555401]  # <- поставь свой id если нужно
 
-# limits by premium level
-LIMITS = {"обычный": 4, "золотой": 10, "алмазный": None}  # None = unlimited
+LIMITS = {"обычный": 4, "золотой": 10, "алмазный": None}
 
-# yt-dlp settings
 YDL_FORMAT = "best[ext=mp4]/best"
 COOKIES_FILE = "cookies.txt" if os.path.exists("cookies.txt") else None
 FFMPEG_LOCATION = None
 
-# Logging
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
-# ---------------- Bot / Dispatcher ----------------
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
-# ---------------- Small types ----------------
+# ---------------- types & queues ----------------
 @dataclass
 class DownloadJob:
     id: str
@@ -71,10 +59,10 @@ class DownloadJob:
 
 download_queue: deque[DownloadJob] = deque()
 queue_lock = asyncio.Lock()
-awaiting_link: Dict[int, bool] = {}  # user_id -> waiting for link
-last_links: Dict[int, str] = {}  # last sent link from user
+awaiting_link: Dict[int, bool] = {}   # user_id -> waiting for link
+last_links: Dict[int, str] = {}       # last sent link from user
 
-# ---------------- Database ----------------
+# ---------------- DB helpers ----------------
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
@@ -136,9 +124,7 @@ async def can_user_download(user_id: int) -> bool:
     premium = row[2]
     downloads_today = row[3] or 0
     limit = LIMITS.get(premium, 4)
-    if limit is None:
-        return True
-    return downloads_today < limit
+    return (limit is None) or (downloads_today < limit)
 
 # ---------------- UI / commands ----------------
 def main_buttons() -> InlineKeyboardMarkup:
@@ -156,7 +142,7 @@ async def register_commands():
         BotCommand(command="download", description="Скачать видео"),
         BotCommand(command="about", description="О боте"),
         BotCommand(command="premium", description="Информация о премиум"),
-        BotCommand(command="grant_premium", description="(Админ) выдать премиум: /grant_premium <user_id> <level>")
+        BotCommand(command="grant_premium", description="(Админ) выдать премиум")
     ]
     try:
         await bot.set_my_commands(commands)
@@ -166,12 +152,12 @@ async def register_commands():
 # ---------------- Handlers ----------------
 @dp.message(CommandStart())
 async def start_handler(msg: Message):
+    # ЧИСТЫЙ старт — без упоминания YouTube
     await ensure_user(msg.from_user.id, msg.from_user.username)
     await msg.answer(
         "Привет! 👋\n\n"
-        "Я могу скачивать видео из TikTok и Instagram (Reels / посты / IGTV).\n"
-        "❌ YouTube не поддерживается — при отправке YouTube-ссылки я сразу сообщу.\n\n"
-        "Отправь ссылку на видео или нажми «Скачать видео».",
+        "Я скачиваю видео и медиа из TikTok и Instagram (Reels / посты / IGTV).\n\n"
+        "Отправь ссылку на TikTok или Instagram либо нажми «Скачать видео».",
         reply_markup=main_buttons()
     )
 
@@ -187,7 +173,7 @@ async def cmd_profile(msg: Message):
 
 @dp.message(Command("about"))
 async def cmd_about(msg: Message):
-    await msg.answer("Этот бот скачивает TikTok и Instagram (через yt-dlp). YouTube не поддерживается. Файлы удаляются после отправки.")
+    await msg.answer("Этот бот скачивает TikTok и Instagram (через yt-dlp + обработку фото-постов).")
 
 @dp.message(Command("premium"))
 async def cmd_premium(msg: Message):
@@ -249,19 +235,11 @@ async def cb_download(cq: CallbackQuery):
         await process_incoming_link(user_id, cq.message.chat.id, last, cq.message)
     else:
         awaiting_link[user_id] = True
+        # корректный текст подсказки — только TikTok / Instagram
         await cq.message.answer("📩 Отправь ссылку на TikTok или Instagram")
     await cq.answer()
 
-# ---------------- Queue / worker ----------------
-async def enqueue_download(job: DownloadJob):
-    async with queue_lock:
-        if job.premium_level == "алмазный":
-            download_queue.appendleft(job)
-        else:
-            download_queue.append(job)
-    logger.info("Job queued: %s", job)
-
-# ---------------- yt-dlp helpers ----------------
+# ---------------- utils & detection ----------------
 class YouTubeNotSupported(Exception):
     pass
 
@@ -286,73 +264,56 @@ def is_instagram_url(url: str) -> bool:
 def run_yt_dlp_blocking(url: str, outdir: str, ydl_format: Optional[str] = None) -> Tuple[str, dict]:
     if is_youtube_url(url):
         raise YouTubeNotSupported()
-
     ydl_opts = {
         "format": ydl_format or YDL_FORMAT,
         "outtmpl": os.path.join(outdir, "%(id)s.%(ext)s"),
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
-        "http_headers": {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+        "http_headers": {"User-Agent": "Mozilla/5.0"},
     }
     if COOKIES_FILE:
         ydl_opts["cookiefile"] = COOKIES_FILE
     if FFMPEG_LOCATION:
         ydl_opts["ffmpeg_location"] = FFMPEG_LOCATION
-
     with YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
         filename = ydl.prepare_filename(info)
         return filename, info
 
-# ---------------- TikTok: video OR photo-post parsing & download ----------------
+# ---------------- TikTok: robust video/photo handling ----------------
 async def download_tiktok_content(url: str) -> dict:
     """
-    Returns:
-      {"type":"video","file":"/tmp/..","tmpdir":...}
-    or
-      {"type":"photos","images":[local_paths], "audio_file":"/tmp/..", "tmpdir":...}
-    Raises exceptions on fail.
+    Возвращает структуру:
+      {"type":"video","file":...,"tmpdir":...}
+    или
+      {"type":"photos","images":[local_paths], "audio_file":..., "tmpdir":...}
+    или выбрасывает исключение.
     """
     tmpdir = tempfile.mkdtemp(prefix="ttjob_")
     loop = asyncio.get_event_loop()
 
-    # 1) Try to use yt-dlp extract_info (download=False) to detect video.
-    def ydl_extract_info_no_download():
-        ydl_opts = {
-            "quiet": True,
-            "no_warnings": True,
-            "noplaylist": True,
-            "skip_download": True,
-            "http_headers": {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
-        }
+    def ydl_info_no_download():
+        opts = {"quiet": True, "no_warnings": True, "noplaylist": True, "skip_download": True, "http_headers": {"User-Agent": "Mozilla/5.0"}}
         if COOKIES_FILE:
-            ydl_opts["cookiefile"] = COOKIES_FILE
-        with YoutubeDL(ydl_opts) as ydl:
+            opts["cookiefile"] = COOKIES_FILE
+        with YoutubeDL(opts) as ydl:
             return ydl.extract_info(url, download=False)
 
+    info = None
     try:
-        info = await loop.run_in_executor(None, ydl_extract_info_no_download)
+        info = await loop.run_in_executor(None, ydl_info_no_download)
     except Exception as e:
-        # yt-dlp couldn't handle the URL (e.g. photo-post redirect). We'll fallback to HTML parsing below.
-        info = None
-        logger.debug("yt-dlp extract_info failed or unsupported: %s", e)
+        logger.debug("yt-dlp extract_info failed (will fallback to HTML parse): %s", e)
 
-    # If yt-dlp returned info and it looks like a video -> download it via yt-dlp
+    # если info указывает на видео — скачать через yt-dlp
     if isinstance(info, dict) and (info.get("formats") or info.get("ext") == "mp4" or info.get("duration")):
         try:
             def ydl_download():
-                ydl_opts = {
-                    "format": "best[ext=mp4]/best",
-                    "outtmpl": os.path.join(tmpdir, "%(id)s.%(ext)s"),
-                    "quiet": True,
-                    "no_warnings": True,
-                    "noplaylist": True,
-                    "http_headers": {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
-                }
+                opts = {"format": "best[ext=mp4]/best", "outtmpl": os.path.join(tmpdir, "%(id)s.%(ext)s"), "quiet": True, "no_warnings": True, "noplaylist": True, "http_headers": {"User-Agent": "Mozilla/5.0"}}
                 if COOKIES_FILE:
-                    ydl_opts["cookiefile"] = COOKIES_FILE
-                with YoutubeDL(ydl_opts) as ydl:
+                    opts["cookiefile"] = COOKIES_FILE
+                with YoutubeDL(opts) as ydl:
                     data = ydl.extract_info(url, download=True)
                     return ydl.prepare_filename(data)
             filename = await loop.run_in_executor(None, ydl_download)
@@ -360,16 +321,12 @@ async def download_tiktok_content(url: str) -> dict:
         except YouTubeNotSupported:
             shutil.rmtree(tmpdir, ignore_errors=True)
             raise
-        except Exception as e:
+        except Exception:
             shutil.rmtree(tmpdir, ignore_errors=True)
             raise
 
-    # 2) Fallback: treat as photo-post (parse HTML to find image URLs + possible audio)
-    # We'll try to GET the page (follow redirects) and search for image/audio urls in HTML/JSON.
-    images_urls: List[str] = []
-    audio_url: Optional[str] = None
-
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    # fallback: HTML / JSON parse to find images + audio (photo-post)
+    headers = {"User-Agent": "Mozilla/5.0"}
     async with aiohttp.ClientSession() as session:
         try:
             async with session.get(url, headers=headers, timeout=20, allow_redirects=True) as resp:
@@ -378,91 +335,68 @@ async def download_tiktok_content(url: str) -> dict:
             shutil.rmtree(tmpdir, ignore_errors=True)
             raise RuntimeError(f"Не удалось получить страницу TikTok: {e}")
 
-    # Try to extract JSON blocks often embedded on the page (best-effort)
-    # 1) window['SIGI_STATE'] = {...}
-    json_text = None
-    m = re.search(r"window\.__INITIAL_STATE__\s*=\s*({.+?});\s*window\.__", html, flags=re.S)
-    if not m:
-        m = re.search(r"window\['SIGI_STATE'\]\s*=\s*({.+?});", html, flags=re.S)
-    if not m:
-        m = re.search(r"window\.__SOME__\s*=\s*({.+?});", html, flags=re.S)  # conservative fallback
-    if m:
-        json_text = m.group(1)
-    else:
-        # Try to find large JSON that contains "ItemModule"
-        jmatch = re.search(r"(\{.+\"ItemModule\":\s*\{.+\}\s*\}.+?)</script>", html, flags=re.S)
-        if jmatch:
-            json_text = jmatch.group(1)
+    # попытки извлечь JSON из html (ItemModule, SIGI_STATE и т.п.)
+    images_urls: List[str] = []
+    audio_url: Optional[str] = None
 
-    if json_text:
+    # common JSON blobs patterns
+    m = re.search(r"window\.__INITIAL_STATE__\s*=\s*({.+?});", html, flags=re.S) or \
+        re.search(r"window\['SIGI_STATE'\]\s*=\s*({.+?});", html, flags=re.S) or \
+        re.search(r"(\{.+\"ItemModule\":\s*\{.+\}\s*\}.+?)</script>", html, flags=re.S)
+
+    if m:
         try:
-            data = json.loads(json_text)
-            # ItemModule typically contains items keyed by id
+            j = json.loads(m.group(1))
             item_module = None
-            if "ItemModule" in data:
-                item_module = data["ItemModule"]
+            if "ItemModule" in j:
+                item_module = j["ItemModule"]
             else:
-                # sometimes deeper or under props
-                for key in ("props", "initialProps", "appProps", "ItemModule"):
-                    if isinstance(data.get(key), dict) and "ItemModule" in data.get(key):
-                        item_module = data.get(key)["ItemModule"]
+                for key in ("props", "initialProps", "appProps"):
+                    maybe = j.get(key) or {}
+                    if isinstance(maybe, dict) and "ItemModule" in maybe:
+                        item_module = maybe["ItemModule"]
                         break
             if item_module and isinstance(item_module, dict):
-                # pick first item
                 first = next(iter(item_module.values()))
-                # possible keys: 'images', 'imageUrls', 'imageList', 'images' etc.
-                for key in ("images", "imageList", "imageUrls", "image_src", "covers"):
+                for key in ("images", "imageList", "imageUrls", "image_list", "covers"):
                     val = first.get(key)
                     if val:
-                        # image list may be list of dicts or list of strings
                         if isinstance(val, list):
                             for it in val:
                                 if isinstance(it, dict):
-                                    u = it.get("url") or it.get("uri") or it.get("url_list") or it.get("urlList")
+                                    u = it.get("url") or it.get("uri")
                                     if isinstance(u, str):
                                         images_urls.append(u)
                                 elif isinstance(it, str):
                                     images_urls.append(it)
                         elif isinstance(val, str):
                             images_urls.append(val)
-                # sometimes thumbnails under 'video' or 'thumb' etc.
-                # try 'music' for audio
                 music = first.get("music") or first.get("musicInfo")
-                if music and isinstance(music, dict):
+                if isinstance(music, dict):
                     audio_url = music.get("playUrl") or music.get("url") or music.get("audioUrl")
         except Exception:
-            logger.debug("Failed to parse JSON blob for images (ignored)", exc_info=True)
+            logger.debug("json parse failed", exc_info=True)
 
-    # If no JSON-based images found, fallback to regex grabbing of image urls in HTML
+    # regex fallback for images
     if not images_urls:
-        # find urls to typical image files (jpg/png/webp) — filter and dedupe
         found = re.findall(r"https?://[^\s'\"<>]+?\.(?:jpe?g|png|webp)(?:\?[^\s'\"<>]*)?", html, flags=re.I)
-        # filter likely tiktok CDN images (best-effort)
-        filtered = []
-        for u in found:
-            if "tiktok" in u or "p16" in u or "p77" in u or "p19" in u or "tiktokcdn" in u or "snssdk" in u:
-                filtered.append(u)
-            else:
-                filtered.append(u)  # also accept others (less strict)
-        # dedupe preserving order
         seen = set()
-        for u in filtered:
+        for u in found:
             if u not in seen:
                 seen.add(u)
                 images_urls.append(u)
 
-    # Try to find audio urls in HTML as fallback
+    # audio regex fallback
     if not audio_url:
-        audio_matches = re.findall(r"https?://[^\s'\"<>]+?\.(?:mp3|m4a|aac|wav|ogg)(?:\?[^\s'\"<>]*)?", html, flags=re.I)
+        audio_matches = re.findall(r"https?://[^\s'\"<>]+?\.(?:mp3|m4a|aac|ogg)(?:\?[^\s'\"<>]*)?", html, flags=re.I)
         if audio_matches:
             audio_url = audio_matches[0]
 
-    # If we still have neither images nor audio -> fail
     if not images_urls and not audio_url:
         shutil.rmtree(tmpdir, ignore_errors=True)
-        raise RuntimeError("Не удалось найти изображения или аудио в этой странице TikTok (возможно приватный пост или нестандартный формат).")
+        raise RuntimeError("Не удалось найти изображения или аудио в этой странице TikTok (возможно приватный пост).")
 
-    # Download images (limit to 20)
+    # скачиваем изображения (до 20)
     local_images: List[str] = []
     max_images = 20
     async with aiohttp.ClientSession() as session:
@@ -472,52 +406,52 @@ async def download_tiktok_content(url: str) -> dict:
                     if r.status == 200:
                         ext = ".jpg"
                         ct = r.headers.get("Content-Type", "")
-                        if "png" in ct:
-                            ext = ".png"
-                        elif "webp" in ct:
-                            ext = ".webp"
+                        if "png" in ct: ext = ".png"
+                        elif "webp" in ct: ext = ".webp"
                         local = os.path.join(tmpdir, f"img_{i}_{uuid.uuid4().hex}{ext}")
                         with open(local, "wb") as f:
                             f.write(await r.read())
                         local_images.append(local)
             except Exception as e:
-                logger.debug("Failed to download image %s : %s", img_u, e)
+                logger.debug("image download failed %s : %s", img_u, e)
 
-    # Download audio if found
+    # качаем аудио если есть
     local_audio = None
     if audio_url:
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(audio_url, timeout=30) as r:
                     if r.status == 200:
-                        # choose extension from content-type
                         ext = ".mp3"
                         ct = r.headers.get("Content-Type", "")
-                        if "mpeg" in ct or "mp3" in ct:
-                            ext = ".mp3"
-                        elif "m4a" in ct or "aac" in ct:
-                            ext = ".m4a"
-                        elif "ogg" in ct:
-                            ext = ".ogg"
+                        if "mpeg" in ct or "mp3" in ct: ext = ".mp3"
+                        elif "m4a" in ct or "aac" in ct: ext = ".m4a"
+                        elif "ogg" in ct: ext = ".ogg"
                         local_audio = os.path.join(tmpdir, "audio" + ext)
                         with open(local_audio, "wb") as f:
                             f.write(await r.read())
         except Exception as e:
-            logger.debug("Failed to download audio %s : %s", audio_url, e)
+            logger.debug("audio download failed %s : %s", audio_url, e)
             local_audio = None
 
-    # If no local images were downloaded but we had URLs, return URLs (bot will attempt to send by URL)
     if not local_images and images_urls:
-        # return images as URLs so caller may try to send remote urls
+        # не удалось скачать локально, вернём URL-ы (caller попытается отправить их по URL)
         return {"type": "photos_urls", "images": images_urls, "audio_url": audio_url, "tmpdir": tmpdir}
 
     return {"type": "photos", "images": local_images, "audio_file": local_audio, "tmpdir": tmpdir}
 
-# ---------------- Download worker ----------------
+# ---------------- Worker ----------------
+async def enqueue_download(job: DownloadJob):
+    async with queue_lock:
+        if job.premium_level == "алмазный":
+            download_queue.appendleft(job)
+        else:
+            download_queue.append(job)
+    logger.info("Job queued: %s", job)
+
 async def download_worker():
     logger.info("Download worker started")
     loop = asyncio.get_event_loop()
-
     async with aiohttp.ClientSession() as session:
         while True:
             job = None
@@ -537,7 +471,7 @@ async def download_worker():
                     logger.exception("notify error")
                 continue
 
-            # Quick YouTube safety
+            # safety: if it's youtube url, reply politely (but we don't advertise in start)
             if is_youtube_url(job.url):
                 try:
                     await bot.send_message(job.chat_id, "❌ Этот бот не может загружать YouTube видео.")
@@ -545,7 +479,7 @@ async def download_worker():
                     pass
                 continue
 
-            # Process TikTok
+            # TikTok
             if is_tiktok_url(job.url):
                 try:
                     res = await download_tiktok_content(job.url)
@@ -557,7 +491,6 @@ async def download_worker():
                         pass
                     continue
 
-                # Video case
                 if res.get("type") == "video":
                     filename = res.get("file")
                     try:
@@ -572,7 +505,6 @@ async def download_worker():
                         except Exception:
                             pass
                     finally:
-                        # cleanup video tmpdir
                         try:
                             parent = os.path.dirname(filename)
                             if parent and parent.startswith(tempfile.gettempdir()):
@@ -580,38 +512,27 @@ async def download_worker():
                         except Exception:
                             pass
 
-                # Local images + audio
                 elif res.get("type") == "photos":
                     images = res.get("images", [])
                     audio_file = res.get("audio_file")
                     tmpdir_from = res.get("tmpdir")
                     media = []
-                    local_paths = []
                     try:
                         for p in images:
-                            try:
-                                local_paths.append(p)
-                                media.append(InputMediaPhoto(media=FSInputFile(p)))
-                            except Exception:
-                                logger.debug("Failed prepare media for %s", p)
+                            media.append(InputMediaPhoto(media=FSInputFile(p)))
                         if media:
-                            # Telegram allows up to 10 in media_group
-                            # split into groups of 10
                             for i in range(0, len(media), 10):
                                 batch = media[i:i+10]
                                 try:
                                     await bot.send_media_group(job.chat_id, batch)
-                                except Exception as e:
-                                    logger.exception("send_media_group failed: %s", e)
-                                    # fallback: send individually
+                                except Exception:
                                     for mm in batch:
                                         try:
                                             await bot.send_photo(job.chat_id, mm.media)
                                         except Exception:
                                             pass
                         else:
-                            await bot.send_message(job.chat_id, "📸 Это TikTok-пост с фотографиями, но не удалось собрать превью.")
-                        # send audio if exists
+                            await bot.send_message(job.chat_id, "📸 Это TikTok-пост с фотографиями, но не удалось сформировать превью.")
                         if audio_file and os.path.exists(audio_file):
                             try:
                                 await bot.send_message(job.chat_id, "🎵 Музыка из поста:")
@@ -620,38 +541,28 @@ async def download_worker():
                                 logger.exception("Failed to send audio")
                         await increment_download(job.user_id)
                     finally:
-                        # cleanup local files
-                        for p in local_paths:
-                            try:
-                                os.remove(p)
-                            except Exception:
-                                pass
+                        # cleanup
                         try:
                             if tmpdir_from and os.path.exists(tmpdir_from):
                                 shutil.rmtree(tmpdir_from, ignore_errors=True)
                         except Exception:
                             pass
 
-                # Photos as remote URLs (couldn't download locally)
                 elif res.get("type") == "photos_urls":
                     images = res.get("images", [])[:10]
                     audio_url = res.get("audio_url")
                     try:
-                        # try sending by URL (Telegram accepts URL in send_photo)
                         for img in images:
                             try:
                                 await bot.send_photo(job.chat_id, img)
                             except Exception:
                                 logger.debug("Failed send photo by URL %s", img)
                         if audio_url:
-                            await bot.send_message(job.chat_id, "🎵 Музыка из поста:")
                             try:
                                 await bot.send_audio(job.chat_id, audio_url)
                             except Exception:
                                 logger.debug("Failed send audio by URL %s", audio_url)
                         await increment_download(job.user_id)
-                    except Exception:
-                        pass
                     finally:
                         try:
                             td = res.get("tmpdir")
@@ -659,16 +570,14 @@ async def download_worker():
                                 shutil.rmtree(td, ignore_errors=True)
                         except Exception:
                             pass
-
                 else:
                     try:
                         await bot.send_message(job.chat_id, "❌ Неизвестный формат TikTok-поста.")
                     except Exception:
                         pass
+                continue
 
-                continue  # done with this job
-
-            # Process Instagram
+            # Instagram
             if is_instagram_url(job.url):
                 tmpdir_job = tempfile.mkdtemp(prefix="job_")
                 try:
@@ -729,7 +638,7 @@ async def process_incoming_link(user_id: int, chat_id: int, link: str, msg_obj: 
     row = await get_user_row(user_id)
     premium_level = row[2] if row else "обычный"
 
-    # If link is YouTube -> immediately inform user
+    # if youtube -> polite reply (we do not advertise it in start)
     if is_youtube_url(link):
         if msg_obj:
             await msg_obj.answer("❌ Этот бот не может загружать YouTube видео.")
@@ -757,8 +666,9 @@ async def handle_message(msg: Message):
     user_id = msg.from_user.id
     text = (msg.text or "").strip()
 
-    is_link = any(x in text for x in ("youtube.com", "youtu.be", "tiktok.com", "vt.tiktok.com", "vm.tiktok", "instagram.com", "instagr.am"))
+    is_link = any(x in text for x in ("tiktok.com", "vm.tiktok", "vt.tiktok.com", "instagram.com", "instagr.am", "youtube.com", "youtu.be"))
     if is_link:
+        # for any link we call process_incoming_link which handles validation/YouTube-block etc.
         await process_incoming_link(user_id, msg.chat.id, text, msg)
         return
 
@@ -767,10 +677,11 @@ async def handle_message(msg: Message):
         if is_link:
             await process_incoming_link(user_id, msg.chat.id, text, msg)
         else:
+            # корректный текст подсказки — TikTok / Instagram
             await msg.answer("❌ Пожалуйста, отправь ссылку на TikTok или Instagram.")
         return
 
-    await msg.answer("Нажми «Скачать видео» или используй /download. Для справки /about", reply_markup=main_buttons())
+    await msg.answer("Нажми «Скачать видео» или отправь ссылку на TikTok / Instagram.", reply_markup=main_buttons())
 
 # ---------------- Run ----------------
 async def main():
