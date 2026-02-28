@@ -1,15 +1,13 @@
 # main.py
 """
-Полный Telegram-бот:
-- скачивает TikTok (включая фото-посты: скачивает картинки + музыку)
-- скачивает Instagram (yt-dlp)
-- YouTube жёстко заблокирован (чистое сообщение пользователю)
-- UI: Профиль, Скачать видео, О боте, Премиум
+Telegram bot:
+- TikTok downloader (включая фото-посты: скачивает картинки + музыку)
+- Instagram downloader через yt-dlp
+- YouTube НЕ рекламируется в стартовом тексте; при отправке YouTube-ссылки бот отвечает вежливо
 - Магазин премиума через Telegram Stars (currency="XTR", provider_token="")
-- База SQLite: хранит premium и premium_expires
-- Аккуратная очистка временных файлов и обработка ошибок
+- Цены: Золотой = 270⭐ (30 дней), Алмазный = 650⭐ (90 дней)
+- SQLite для пользователей + expiry
 """
-
 import os
 import re
 import json
@@ -38,28 +36,33 @@ from aiogram.types import (
 )
 
 # ---------------- CONFIG ----------------
-TOKEN = os.getenv("TOKEN")  # <- вставь токен бота сюда
+TOKEN = os.getenv("TOKEN")  # <- вставь токен
 if not TOKEN or TOKEN.startswith("PASTE_"):
     raise SystemExit("ERROR: Вставь реальный токен в TOKEN в main.py")
 
-# этот id/список получит уведомление о каждой покупке (и будет 'владельцем' для логики)
-ADMIN_IDS = [6705555401]  # <- поставь сюда свой числовой Telegram ID
+# Укажи свой числовой Telegram ID (уведомления о покупках)
+ADMIN_IDS = [6705555401]  # <- замени на свой id
 
-# БД, воркеры, логирование
 DB_PATH = "bot_users.db"
 DOWNLOAD_WORKERS = 1
 LOG_LEVEL = logging.INFO
 
-# магазин / звёзды
-STARS_PROVIDER_TOKEN = ""  # для Telegram Stars provider_token = "" (пустая строка)
+# Payments (Telegram Stars)
+STARS_PROVIDER_TOKEN = ""  # пустая строка — для Telegram Stars
 STARS_CURRENCY = "XTR"
 
-# yt-dlp / ffmpeg
+# Premium pricing/durations
+GOLD_PRICE_STARS = 270
+GOLD_DAYS = 30
+DIAMOND_PRICE_STARS = 650
+DIAMOND_DAYS = 90
+
+# yt-dlp / other
 YDL_FORMAT = "best[ext=mp4]/best"
 COOKIES_FILE = "cookies.txt" if os.path.exists("cookies.txt") else None
-FFMPEG_LOCATION = None  # можно указать путь к ffmpeg
+FFMPEG_LOCATION = None
 
-# лимиты
+# limits
 LIMITS = {"обычный": 4, "золотой": 10, "алмазный": None}
 
 # Logging
@@ -99,7 +102,7 @@ async def init_db():
             )
         """)
         await db.commit()
-        # safe migration: ensure column exists
+        # safe migration: ensure column exists (best-effort)
         async with db.execute("PRAGMA table_info(users)") as cur:
             cols = await cur.fetchall()
         col_names = [c[1] for c in cols]
@@ -250,7 +253,7 @@ def run_yt_dlp_blocking(url: str, outdir: str, ydl_format: Optional[str] = None)
         filename = ydl.prepare_filename(info)
         return filename, info
 
-# ---------------- TikTok robust handler (video & photo-posts) ----------------
+# ---------------- TikTok: robust handling ----------------
 async def download_tiktok_content(url: str) -> dict:
     tmpdir = tempfile.mkdtemp(prefix="ttjob_")
     loop = asyncio.get_event_loop()
@@ -287,7 +290,7 @@ async def download_tiktok_content(url: str) -> dict:
             shutil.rmtree(tmpdir, ignore_errors=True)
             raise
 
-    # Fallback: parse page HTML/JSON for images & audio
+    # Fallback: parse HTML / JSON for images & audio (photo-posts)
     headers = {"User-Agent": "Mozilla/5.0"}
     async with aiohttp.ClientSession() as session:
         try:
@@ -300,7 +303,6 @@ async def download_tiktok_content(url: str) -> dict:
     images_urls: List[str] = []
     audio_url: Optional[str] = None
 
-    # JSON blobs search
     m = re.search(r"window\.__INITIAL_STATE__\s*=\s*({.+?});", html, flags=re.S) or \
         re.search(r"window\['SIGI_STATE'\]\s*=\s*({.+?});", html, flags=re.S) or \
         re.search(r"(\{.+\"ItemModule\":\s*\{.+\}\s*\}.+?)</script>", html, flags=re.S)
@@ -338,7 +340,6 @@ async def download_tiktok_content(url: str) -> dict:
         except Exception:
             logger.debug("json parse failed", exc_info=True)
 
-    # regex fallback
     if not images_urls:
         found = re.findall(r"https?://[^\s'\"<>]+?\.(?:jpe?g|png|webp)(?:\?[^\s'\"<>]*)?", html, flags=re.I)
         seen = set()
@@ -356,7 +357,7 @@ async def download_tiktok_content(url: str) -> dict:
         shutil.rmtree(tmpdir, ignore_errors=True)
         raise RuntimeError("Не удалось найти изображения или аудио в этой странице TikTok (возможно приватный пост).")
 
-    # download images (limit)
+    # Download images (limit)
     local_images: List[str] = []
     max_images = 20
     async with aiohttp.ClientSession() as session:
@@ -375,7 +376,7 @@ async def download_tiktok_content(url: str) -> dict:
             except Exception as e:
                 logger.debug("image download failed %s : %s", img_u, e)
 
-    # download audio
+    # Download audio if present
     local_audio = None
     if audio_url:
         try:
@@ -395,12 +396,11 @@ async def download_tiktok_content(url: str) -> dict:
             local_audio = None
 
     if not local_images and images_urls:
-        # couldn't download locally — return URLs
         return {"type": "photos_urls", "images": images_urls, "audio_url": audio_url, "tmpdir": tmpdir}
 
     return {"type": "photos", "images": local_images, "audio_file": local_audio, "tmpdir": tmpdir}
 
-# ---------------- Download queue worker ----------------
+# ---------------- Queue worker ----------------
 async def enqueue_download(job: DownloadJob):
     async with queue_lock:
         if job.premium_level == "алмазный":
@@ -431,7 +431,6 @@ async def download_worker():
                     logger.exception("notify error")
                 continue
 
-            # youtube safety
             if is_youtube_url(job.url):
                 try:
                     await bot.send_message(job.chat_id, "❌ Этот бот не может загружать YouTube видео.")
@@ -451,6 +450,7 @@ async def download_worker():
                         pass
                     continue
 
+                # video
                 if res.get("type") == "video":
                     filename = res.get("file")
                     try:
@@ -472,6 +472,7 @@ async def download_worker():
                         except Exception:
                             pass
 
+                # photos (local)
                 elif res.get("type") == "photos":
                     images = res.get("images", [])
                     audio_file = res.get("audio_file")
@@ -507,6 +508,7 @@ async def download_worker():
                         except Exception:
                             pass
 
+                # photos URLs
                 elif res.get("type") == "photos_urls":
                     images = res.get("images", [])[:10]
                     audio_url = res.get("audio_url")
@@ -529,7 +531,6 @@ async def download_worker():
                                 shutil.rmtree(td, ignore_errors=True)
                         except Exception:
                             pass
-
                 else:
                     try:
                         await bot.send_message(job.chat_id, "❌ Неизвестный формат TikTok-поста.")
@@ -585,13 +586,13 @@ async def download_worker():
                         pass
                 continue
 
-            # unsupported
+            # unsupported site
             try:
                 await bot.send_message(job.chat_id, "❌ Этот бот не может загружать видео с этого сайта.")
             except Exception:
                 pass
 
-# ---------------- Payments (Stars shop) ----------------
+# ---------------- Payments: shop via Stars ----------------
 def build_price(label: str, stars_amount: int) -> List[LabeledPrice]:
     return [LabeledPrice(label=label, amount=stars_amount)]
 
@@ -605,8 +606,8 @@ async def cb_premium(cq: CallbackQuery):
         text = "Выбери тариф премиума и оплати звёздами."
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Купить Золотой — 100 ⭐ (30 дней)", callback_data="buy_gold")],
-        [InlineKeyboardButton(text="Купить Алмазный — 300 ⭐ (30 дней)", callback_data="buy_diamond")],
+        [InlineKeyboardButton(text=f"Купить Золотой — {GOLD_PRICE_STARS} ⭐ (30 дней)", callback_data="buy_gold")],
+        [InlineKeyboardButton(text=f"Купить Алмазный — {DIAMOND_PRICE_STARS} ⭐ (3 месяца)", callback_data="buy_diamond")],
         [InlineKeyboardButton(text="Назад", callback_data="menu_back")],
     ])
     await cq.message.answer(text, reply_markup=kb)
@@ -616,14 +617,14 @@ async def cb_premium(cq: CallbackQuery):
 async def cb_buy(cq: CallbackQuery):
     data = cq.data
     if data == "buy_gold":
-        label = "Золотой премиум (30 дней)"
-        days = 30
-        amount = 100
+        label = f"Золотой премиум ({GOLD_DAYS} дней)"
+        days = GOLD_DAYS
+        amount = GOLD_PRICE_STARS
         payload = f"premium:gold:{cq.from_user.id}:{days}:{uuid.uuid4().hex}"
     elif data == "buy_diamond":
-        label = "Алмазный премиум (30 дней)"
-        days = 30
-        amount = 300
+        label = f"Алмазный премиум ({DIAMOND_DAYS} дней)"
+        days = DIAMOND_DAYS
+        amount = DIAMOND_PRICE_STARS
         payload = f"premium:diamond:{cq.from_user.id}:{days}:{uuid.uuid4().hex}"
     else:
         await cq.answer("Неизвестный тариф", show_alert=True)
@@ -636,7 +637,7 @@ async def cb_buy(cq: CallbackQuery):
             title=label,
             description=f"Покупка {label}",
             payload=payload,
-            provider_token=STARS_PROVIDER_TOKEN,  # empty string for Stars
+            provider_token=STARS_PROVIDER_TOKEN,  # empty for Stars
             currency=STARS_CURRENCY,
             prices=prices,
             start_parameter="premium-buy"
@@ -653,37 +654,42 @@ async def process_pre_checkout(pre: PreCheckoutQuery):
     except Exception:
         logger.exception("pre_checkout error")
 
+# handle successful payment messages: aiogram sets successful_payment on Message
+# We'll check in generic message handler first; but provide this handler to be explicit too.
 @dp.message()
-async def handle_successful_payment(msg: Message):
+async def handle_payments_and_messages(msg: Message):
+    # Payment handling
     sp = getattr(msg, "successful_payment", None)
-    if not sp:
-        return  # not a payment message — other handlers will handle
-    payload = sp.invoice_payload
-    try:
-        parts = payload.split(":")
-        if parts[0] == "premium" and len(parts) >= 5:
-            _, level_key, intended_user_id, days_str, rnd = parts[:5]
-            if int(intended_user_id) != msg.from_user.id:
-                await msg.answer("Ошибка: ID плательщика не совпадает с получателем премиума.")
+    if sp:
+        payload = sp.invoice_payload
+        try:
+            parts = payload.split(":")
+            if parts[0] == "premium" and len(parts) >= 5:
+                _, level_key, intended_user_id, days_str, rnd = parts[:5]
+                if int(intended_user_id) != msg.from_user.id:
+                    await msg.answer("Ошибка: ID плательщика не совпадает с получателем премиума.")
+                    return
+                days = int(days_str)
+                level_name = "золотой" if level_key == "gold" else ("алмазный" if level_key == "diamond" else level_key)
+                await set_premium(msg.from_user.id, level_name, days=days)
+                await msg.answer(f"✅ Оплата принята! Тебе выдан премиум: {level_name} на {days} дней.")
+                logger.info("User %s bought %s for %s days", msg.from_user.id, level_name, days)
+                for aid in ADMIN_IDS:
+                    try:
+                        await bot.send_message(aid, f"Пользователь @{msg.from_user.username or msg.from_user.id} купил {level_name} на {days} дней — {sp.total_amount} {sp.currency}.")
+                    except Exception:
+                        pass
                 return
-            days = int(days_str)
-            level_name = "золотой" if level_key == "gold" else ("алмазный" if level_key == "diamond" else level_key)
-            await set_premium(msg.from_user.id, level_name, days=days)
-            await msg.answer(f"✅ Оплата принята! Тебе выдан премиум: {level_name} на {days} дней.")
-            logger.info("User %s bought %s for %s days", msg.from_user.id, level_name, days)
-            # notify admin(s)
-            for aid in ADMIN_IDS:
-                try:
-                    await bot.send_message(aid, f"Пользователь @{msg.from_user.username or msg.from_user.id} купил {level_name} на {days} дней.")
-                except Exception:
-                    pass
-        else:
-            await msg.answer("Оплата принята. Спасибо!")
-    except Exception as e:
-        logger.exception("Handling successful payment error: %s", e)
-        await msg.answer("Оплата прошла, но возникла ошибка при выдаче премиума. Свяжись с админом.")
+        except Exception as e:
+            logger.exception("Handling successful payment error: %s", e)
+            await msg.answer("Оплата прошла, но возникла ошибка при выдаче премиума. Свяжись с админом.")
+            return
 
-# ---------------- Handlers & UI (start / profile / download / about) ----------------
+    # otherwise let generic handler below process text messages
+    # (we forward to the generic processor)
+    await generic_message_handler(msg)
+
+# ---------------- Handlers: start / profile / about / grant ----------------
 @dp.message(CommandStart())
 async def start_handler(msg: Message):
     await ensure_user(msg.from_user.id, msg.from_user.username)
@@ -707,11 +713,7 @@ async def cmd_profile(msg: Message):
 
 @dp.message(Command("about"))
 async def cmd_about(msg: Message):
-    await msg.answer("Этот бот скачивает TikTok и Instagram (через yt-dlp + обработка фото-постов).")
-
-@dp.message(Command("premium"))
-async def cmd_premium(msg: Message):
-    await msg.answer("Открой меню премиума через кнопку 'Премиум' в главном меню.")
+    await msg.answer("Бот скачивает TikTok и Instagram. Поддерживаются видео и фото-посты (фото+музыка).")
 
 @dp.message(Command("grant_premium"))
 async def cmd_grant_premium(msg: Message):
@@ -761,7 +763,7 @@ async def cb_download(cq: CallbackQuery):
         await cq.message.answer("📩 Отправь ссылку на TikTok или Instagram")
     await cq.answer()
 
-# ---------------- Incoming messages and processing ----------------
+# ---------------- Incoming link processing & generic messages ----------------
 async def process_incoming_link(user_id: int, chat_id: int, link: str, msg_obj: Optional[Message] = None):
     last_links[user_id] = link
     await ensure_user(user_id, None)
@@ -790,9 +792,7 @@ async def process_incoming_link(user_id: int, chat_id: int, link: str, msg_obj: 
     else:
         await bot.send_message(chat_id, "⏳ Загрузка началась, пожалуйста подождите...")
 
-@dp.message()
 async def generic_message_handler(msg: Message):
-    # first: successful_payment is handled by a specific handler above; if not, we process text links
     user_id = msg.from_user.id
     text = (msg.text or "").strip()
 
@@ -815,6 +815,7 @@ async def generic_message_handler(msg: Message):
 async def main():
     await init_db()
     await register_commands()
+    # start workers
     workers = [asyncio.create_task(download_worker()) for _ in range(DOWNLOAD_WORKERS)]
     try:
         logger.info("Bot starting polling")
