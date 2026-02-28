@@ -171,7 +171,7 @@ async def register_commands():
 async def start_handler(msg: Message):
     await ensure_user(msg.from_user.id, msg.from_user.username)
     await msg.answer(
-        "Привет! 👋\nЭтот бот скачивает YouTube Shorts и TikTok.\nОтправь ссылку на видео или нажми «Скачать видео».",
+        "Привет! 👋\nЭтот бот скачивает TikTok.\nОтправь ссылку на видео или нажми «Скачать видео».",
         reply_markup=main_buttons()
     )
 
@@ -187,7 +187,7 @@ async def cmd_profile(msg: Message):
 
 @dp.message(Command("about"))
 async def cmd_about(msg: Message):
-    await msg.answer("Этот бот скачивает YouTube Shorts и TikTok (через yt-dlp). Файлы удаляются после отправки.")
+    await msg.answer("Этот бот скачивает и TikTok (через yt-dlp). Файлы удаляются после отправки.")
 
 @dp.message(Command("premium"))
 async def cmd_premium(msg: Message):
@@ -418,7 +418,7 @@ async def handle_message(msg: Message):
         if is_link:
             await process_incoming_link(user_id, msg.chat.id, text, msg)
         else:
-            await msg.answer("❌ Пожалуйста, отправь ссылку на YouTube Shorts или TikTok.")
+            await msg.answer("❌ Пожалуйста, отправь ссылку TikTok.")
         return
 
     await msg.answer("Нажми «Скачать видео» или используй /download. Для справки /about", reply_markup=main_buttons())
